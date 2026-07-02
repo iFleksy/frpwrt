@@ -1,0 +1,121 @@
+#!/bin/sh /etc/rc.common
+# procd init script for frp client (frpc) on OpenWRT
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/frpc
+CONF_DIR=/var/etc
+CONF_FILE="$CONF_DIR/frpc.toml"
+
+# Append a "key = value" line, quoting the value as a TOML string.
+append_str() {
+	local key="$1" val="$2"
+	[ -n "$val" ] && printf '%s = "%s"\n' "$key" "$val" >> "$CONF_FILE"
+}
+
+# Append a "key = value" line with a raw (unquoted) value, e.g. numbers.
+append_raw() {
+	local key="$1" val="$2"
+	[ -n "$val" ] && printf '%s = %s\n' "$key" "$val" >> "$CONF_FILE"
+}
+
+build_common() {
+	local server_addr server_port auth_token log_level log_max_days
+
+	config_get server_addr common server_addr
+	config_get server_port common server_port
+	config_get auth_token common auth_token
+	config_get log_level common log_level info
+	config_get log_max_days common log_max_days 3
+
+	if [ -z "$server_addr" ] || [ -z "$server_port" ]; then
+		echo "frpc: server_addr/server_port not configured in /etc/config/frpc" >&2
+		return 1
+	fi
+
+	append_str serverAddr "$server_addr"
+	append_raw serverPort "$server_port"
+	[ -n "$auth_token" ] && {
+		echo 'auth.method = "token"' >> "$CONF_FILE"
+		append_str auth.token "$auth_token"
+	}
+
+	# frp writes its own log; log to file so it survives across restarts.
+	append_str 'log.to' "/var/log/frpc.log"
+	append_str 'log.level' "$log_level"
+	append_raw 'log.maxDays' "$log_max_days"
+
+	return 0
+}
+
+build_proxy() {
+	local cfg="$1"
+	local enabled name type local_ip local_port remote_port
+
+	config_get_bool enabled "$cfg" enabled 1
+	[ "$enabled" -eq 0 ] && return 0
+
+	config_get name "$cfg" name
+	config_get type "$cfg" type tcp
+	config_get local_ip "$cfg" local_ip 127.0.0.1
+	config_get local_port "$cfg" local_port
+	config_get remote_port "$cfg" remote_port
+
+	[ -z "$name" ] && name="$cfg"
+
+	{
+		echo ""
+		echo "[[proxies]]"
+	} >> "$CONF_FILE"
+	append_str name "$name"
+	append_str type "$type"
+	append_str localIP "$local_ip"
+	append_raw localPort "$local_port"
+	append_raw remotePort "$remote_port"
+}
+
+generate_config() {
+	mkdir -p "$CONF_DIR"
+	: > "$CONF_FILE"
+
+	config_load frpc
+	build_common || return 1
+	config_foreach build_proxy proxy
+	return 0
+}
+
+start_service() {
+	local enabled
+	config_load frpc
+	config_get_bool enabled common enabled 1
+	[ "$enabled" -eq 0 ] && {
+		echo "frpc: disabled in /etc/config/frpc (option enabled '0')" >&2
+		return 1
+	}
+
+	[ -x "$PROG" ] || {
+		echo "frpc: binary $PROG not found. Run the installer first." >&2
+		return 1
+	}
+
+	generate_config || return 1
+
+	procd_open_instance
+	procd_set_param command "$PROG" -c "$CONF_FILE"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param file "$CONF_FILE"
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "frpc"
+}
